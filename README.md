@@ -242,34 +242,3 @@ concept_mapping = {
 1. **Termnology Dashboard** for managiing terminologies
 2. **Backend Plugin** for saving valueset data instead of modifying current frontend and backend
 
-## Project Impact
-
-### Healthcare Industry Benefits
-- **Reduced Integration Time:** From months to weeks for FHIR implementations
-- **Improved Data Quality:** Standardized medical terminology usage
-- **Cost Reduction:** Open-source alternative to expensive commercial solutions
-- **Innovation Enablement:** Foundation for advanced healthcare applications
-
-### Open Source Community Impact
-- **Knowledge Sharing:** Comprehensive documentation and examples
-- **Educational Resource:** Learning platform for FHIR and medical terminologies
-- **Collaboration Platform:** Foundation for community-driven enhancements
-- **Standards Advancement:** Practical implementation of healthcare standards
-
-## Technical Documentation
-
-### API Documentation
-- **OpenAPI/Swagger** specifications for all endpoints
-- **Interactive Documentation** with example requests/responses
-- **SDK Examples** in multiple programming languages
-- **Integration Guides** for popular healthcare frameworks
-
-### Deployment Guide
-```bash
-# Quick Start
-git clone https://github.com/rajku-dev/care-terminology-server-poc.git
-cd care-terminology-server-poc
-pipenv install && pipenv shell
-python -m terminology_api.es_indexer.indexer
-python manage.py runserver
-```
