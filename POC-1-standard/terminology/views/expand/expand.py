@@ -10,12 +10,15 @@ import unicodedata
 
 logger = logging.getLogger(__name__)
 
+# Maximum terms per Elasticsearch query (safe limit)
+MAX_TERMS_PER_QUERY = 60000
+
 @api_view(['POST'])
 def expand_view(request):
     """
     FHIR ValueSet $expand operation implementation for SNOMED CT
     Works with separate concepts, descriptions, and relationships indices
-    Optimized version matching File 1's efficiency
+    Optimized version matching File 1's efficiency with batch processing for large term sets
     """
     try:
         # Parse request parameters
@@ -75,6 +78,7 @@ def expand_view(request):
         
         # Get all concept IDs from includes
         all_concept_ids = set()
+        include_entire_codesystem = False
         
         for include in includes:
             system = include.get('system')
@@ -84,6 +88,16 @@ def expand_view(request):
                     loinc_resp = query.expand_valueset(filter_text=filter_text, count=count, offset=offset, include_designations=include_designations)
                     return Response(loinc_resp)
                 continue
+            
+            # Check if this include has no specific constraints (empty ValueSet case)
+            has_concepts = 'concept' in include and include['concept']
+            has_filters = 'filter' in include and include['filter']
+            
+            if not has_concepts and not has_filters:
+                # Empty include - expand entire code system
+                include_entire_codesystem = True
+                logger.info("Empty ValueSet detected - will expand from entire SNOMED CT code system")
+                break  # No need to process other includes if we're including everything
                 
             # Handle direct concept codes
             if 'concept' in include:
@@ -109,6 +123,18 @@ def expand_view(request):
                     all_concept_ids.update(descendants)
                     all_concept_ids.add(value)  # Include the concept itself
                     logger.info(f"Found {len(descendants)} descendants for {value}")
+        
+        # Handle entire code system expansion
+        if include_entire_codesystem:
+            if filter_text:
+                # For filtered searches on entire code system, use direct search approach
+                expansion_contains, total_count = get_entire_codesystem_filtered_expansion(
+                    filter_text, display_language, include_designations, count, offset
+                )
+            else:
+                # For unfiltered entire code system, get all active concepts
+                all_concept_ids = get_all_active_concepts()
+                logger.info(f"Retrieved {len(all_concept_ids)} active concepts from entire code system")
         
         logger.info(f"Total concept IDs before exclusions: {len(all_concept_ids)}")
         
@@ -144,7 +170,10 @@ def expand_view(request):
         logger.info(f"Concept IDs after exclusions: {len(all_concept_ids)}")
         
         # Get expansion with efficient filtering and pagination
-        if filter_text:
+        if include_entire_codesystem and filter_text:
+            # Already handled above in get_entire_codesystem_filtered_expansion
+            pass
+        elif filter_text:
             expansion_contains, total_count = get_filtered_expansion(
                 all_concept_ids, filter_text, display_language, include_designations, count, offset
             )
@@ -275,6 +304,113 @@ def get_children_composite(parent_concept_ids):
     
     return children
 
+def get_all_active_concepts():
+    """
+    Get all active concept IDs from the concepts index using composite aggregation
+    """
+    all_concept_ids = set()
+    after_key = None
+    
+    try:
+        while True:
+            query = {
+                "query": {
+                    "term": {"active": True}
+                },
+                "size": 0,
+                "aggs": {
+                    "unique_concepts": {
+                        "composite": {
+                            "size": 10000,
+                            "sources": [
+                                {
+                                    "concept_id": {
+                                        "terms": {
+                                            "field": "_id",
+                                            "order": "asc"
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+            
+            if after_key:
+                query["aggs"]["unique_concepts"]["composite"]["after"] = after_key
+            
+            resp = es.search(
+                index="concepts",
+                body=query,
+                timeout='30s'
+            )
+            
+            buckets = resp.get("aggregations", {}).get("unique_concepts", {}).get("buckets", [])
+            
+            if not buckets:
+                break
+                
+            batch_concepts = {bucket["key"]["concept_id"] for bucket in buckets}
+            all_concept_ids.update(batch_concepts)
+            
+            after_key = resp.get("aggregations", {}).get("unique_concepts", {}).get("after_key")
+            if not after_key:
+                break
+                
+        logger.info(f"Retrieved {len(all_concept_ids)} active concepts")
+        return all_concept_ids
+        
+    except Exception as e:
+        logger.error(f"Error getting all active concepts: {str(e)}")
+        return set()
+
+def get_entire_codesystem_filtered_expansion(filter_text, display_language, include_designations, count, offset):
+    """
+    Handle filtered expansion across the entire SNOMED CT code system without pre-filtering by concept IDs
+    """
+    try:
+        # Normalize search text
+        normalized_filter = normalize_search_text(filter_text)
+        
+        # Build query for entire code system with text filtering
+        query = {
+            "query": {
+                "bool": {
+                    "must": [
+                        {"term": {"active": True}},
+                        {"term": {"language_code": display_language}}
+                    ],
+                    "should": [
+                        # Exact phrase (highest priority)
+                        {"match_phrase": {"term": {"query": normalized_filter, "boost": 10}}},
+                        # Prefix match
+                        {"prefix": {"term": {"value": normalized_filter, "boost": 5}}},
+                    ],
+                    "minimum_should_match": 1
+                }
+            },
+            "_source": ["concept_id", "type_id", "term", "language_code"],
+            "size": 10000,  # Get matching descriptions
+            "sort": [
+                {"_score": {"order": "desc"}},
+                {"term.keyword": {"order": "asc"}}
+            ]
+        }
+        
+        # Execute search
+        resp = es.search(
+            index="descriptions",
+            body=query,
+            timeout='30s'
+        )
+        
+        return process_filtered_results(resp, normalized_filter, display_language, include_designations, count, offset)
+        
+    except Exception as e:
+        logger.error(f"Error getting entire code system filtered expansion: {str(e)}")
+        return [], 0
+
 def get_expansion(concept_ids, display_language, include_designations, count, offset):
     """
     Get expansion without text filtering - optimized like File 1
@@ -300,20 +436,96 @@ def get_expansion(concept_ids, display_language, include_designations, count, of
         logger.error(f"Error getting expansion: {str(e)}")
         return [], 0
 
+def chunk_list(lst, chunk_size):
+    """Split a list into chunks of specified size"""
+    for i in range(0, len(lst), chunk_size):
+        yield lst[i:i + chunk_size]
+
 def get_filtered_expansion(concept_ids, filter_text, display_language, include_designations, count, offset):
     """
-    Get expansion with text filtering - optimized like File 1
+    Get expansion with text filtering - optimized with batch processing for large concept sets
     """
     try:
         # Normalize search text
         normalized_filter = normalize_search_text(filter_text)
+        concept_ids_list = list(concept_ids)
         
-        # Build query with text filtering - similar to File 1 but works with concept_ids list
+        print(f"Processing {len(concept_ids_list)} concepts with filter '{filter_text}'")
+        
+        # If concept set is small enough, use original approach
+        if len(concept_ids_list) <= MAX_TERMS_PER_QUERY:
+            return get_filtered_expansion_single_query(
+                concept_ids_list, normalized_filter, display_language, include_designations, count, offset
+            )
+        
+        # For large concept sets, use batch processing approach
+        return get_filtered_expansion_batched(
+            concept_ids_list, normalized_filter, display_language, include_designations, count, offset
+        )
+        
+    except Exception as e:
+        logger.error(f"Error getting filtered expansion: {str(e)}")
+        return [], 0
+
+def get_filtered_expansion_single_query(concept_ids_list, normalized_filter, display_language, include_designations, count, offset):
+    """
+    Handle filtered expansion with a single query for smaller concept sets
+    """
+    # Build query with text filtering
+    query = {
+        "query": {
+            "bool": {
+                "must": [
+                    {"terms": {"concept_id": concept_ids_list}},
+                    {"term": {"active": True}},
+                    {"term": {"language_code": display_language}}
+                ],
+                "should": [
+                    # Exact phrase (highest priority)
+                    {"match_phrase": {"term": {"query": normalized_filter, "boost": 10}}},
+                    # Prefix match
+                    {"prefix": {"term": {"value": normalized_filter, "boost": 5}}},
+                ],
+                "minimum_should_match": 1
+            }
+        },
+        "_source": ["concept_id", "type_id", "term", "language_code"],
+        "size": 10000,  # Get all matching descriptions
+        "sort": [
+            {"_score": {"order": "desc"}},
+            {"term.keyword": {"order": "asc"}}
+        ]
+    }
+    
+    # Execute search
+    resp = es.search(
+        index="descriptions",
+        body=query,
+        timeout='30s'
+    )
+    
+    return process_filtered_results(resp, normalized_filter, display_language, include_designations, count, offset)
+
+def get_filtered_expansion_batched(concept_ids_list, normalized_filter, display_language, include_designations, count, offset):
+    """
+    Handle filtered expansion with batch processing for large concept sets
+    """
+    all_concept_descriptions = {}
+    
+    # Process in batches
+    batch_count = 0
+    total_batches = (len(concept_ids_list) + MAX_TERMS_PER_QUERY - 1) // MAX_TERMS_PER_QUERY
+    
+    for batch_concept_ids in chunk_list(concept_ids_list, MAX_TERMS_PER_QUERY):
+        batch_count += 1
+        print(f"Processing batch {batch_count}/{total_batches} with {len(batch_concept_ids)} concepts")
+        
+        # Build query for this batch
         query = {
             "query": {
                 "bool": {
                     "must": [
-                        {"terms": {"concept_id": list(concept_ids)}},
+                        {"terms": {"concept_id": batch_concept_ids}},
                         {"term": {"active": True}},
                         {"term": {"language_code": display_language}}
                     ],
@@ -334,135 +546,278 @@ def get_filtered_expansion(concept_ids, filter_text, display_language, include_d
             ]
         }
         
-        # Execute search
-        resp = es.search(
-            index="descriptions",
-            body=query,
-            timeout='30s'
-        )
-        
-        # Process results and group by concept
-        concept_descriptions = {}
-        for hit in resp["hits"]["hits"]:
-            source = hit["_source"]
-            concept_id = source["concept_id"]
-            score = hit["_score"]
-            
-            # Calculate additional scoring
-            additional_score = calculate_additional_score(
-                source["term"], normalized_filter, source["type_id"]
+        # Execute search for this batch
+        try:
+            resp = es.search(
+                index="descriptions",
+                body=query,
+                timeout='30s'
             )
-            final_score = score + additional_score
             
-            # Group by concept and keep best scoring description
-            if concept_id not in concept_descriptions:
-                concept_descriptions[concept_id] = []
-            
-            concept_descriptions[concept_id].append({
-                "description": source,
-                "score": final_score
-            })
+            # Process results and merge with overall results
+            for hit in resp["hits"]["hits"]:
+                source = hit["_source"]
+                concept_id = source["concept_id"]
+                score = hit["_score"]
+                
+                # Calculate additional scoring
+                additional_score = calculate_additional_score(
+                    source["term"], normalized_filter, source["type_id"]
+                )
+                final_score = score + additional_score
+                
+                # Group by concept and keep best scoring description
+                if concept_id not in all_concept_descriptions:
+                    all_concept_descriptions[concept_id] = []
+                
+                all_concept_descriptions[concept_id].append({
+                    "description": source,
+                    "score": final_score
+                })
+                
+        except Exception as e:
+            logger.error(f"Error processing batch {batch_count}: {str(e)}")
+            continue
+    
+    # Sort concepts by their best description score
+    concept_scores = {}
+    for concept_id, descriptions in all_concept_descriptions.items():
+        best_desc = max(descriptions, key=lambda x: x["score"])
+        concept_scores[concept_id] = {
+            "concept_id": concept_id,
+            "score": best_desc["score"],
+            "best_term": best_desc["description"]["term"]
+        }
+    
+    # Sort by score then alphabetically
+    sorted_concepts = sorted(
+        concept_scores.values(),
+        key=lambda x: (-x["score"], x["best_term"].lower())
+    )
+    
+    total_count = len(sorted_concepts)
+    
+    # Apply pagination
+    paginated_concepts = sorted_concepts[offset:offset + count]
+    concept_ids_for_details = [c["concept_id"] for c in paginated_concepts]
+    
+    # Get detailed descriptions for paginated concepts
+    expansion_contains = get_concepts_details_for_expansion(
+        concept_ids_for_details, display_language, include_designations
+    )
+    
+    print(f"Found {total_count} matching concepts for filter '{normalized_filter}' across {batch_count} batches")
+    return expansion_contains, total_count
+
+def process_filtered_results(resp, normalized_filter, display_language, include_designations, count, offset):
+    """
+    Process filtered search results and return paginated expansion
+    """
+    # Process results and group by concept
+    concept_descriptions = {}
+    for hit in resp["hits"]["hits"]:
+        source = hit["_source"]
+        concept_id = source["concept_id"]
+        score = hit["_score"]
         
-        # Sort concepts by their best description score
-        concept_scores = {}
-        for concept_id, descriptions in concept_descriptions.items():
-            best_desc = max(descriptions, key=lambda x: x["score"])
-            concept_scores[concept_id] = {
-                "concept_id": concept_id,
-                "score": best_desc["score"],
-                "best_term": best_desc["description"]["term"]
-            }
-        
-        # Sort by score then alphabetically
-        sorted_concepts = sorted(
-            concept_scores.values(),
-            key=lambda x: (-x["score"], x["best_term"].lower())
+        # Calculate additional scoring
+        additional_score = calculate_additional_score(
+            source["term"], normalized_filter, source["type_id"]
         )
+        final_score = score + additional_score
         
-        total_count = len(sorted_concepts)
+        # Group by concept and keep best scoring description
+        if concept_id not in concept_descriptions:
+            concept_descriptions[concept_id] = []
         
-        # Apply pagination
-        paginated_concepts = sorted_concepts[offset:offset + count]
-        concept_ids_for_details = [c["concept_id"] for c in paginated_concepts]
-        
-        # Get detailed descriptions for paginated concepts
-        expansion_contains = get_concepts_details_for_expansion(
-            concept_ids_for_details, display_language, include_designations
-        )
-        
-        print(f"Found {total_count} matching concepts for filter '{filter_text}'")
-        return expansion_contains, total_count
-        
-    except Exception as e:
-        logger.error(f"Error getting filtered expansion: {str(e)}")
-        return [], 0
+        concept_descriptions[concept_id].append({
+            "description": source,
+            "score": final_score
+        })
+    
+    # Sort concepts by their best description score
+    concept_scores = {}
+    for concept_id, descriptions in concept_descriptions.items():
+        best_desc = max(descriptions, key=lambda x: x["score"])
+        concept_scores[concept_id] = {
+            "concept_id": concept_id,
+            "score": best_desc["score"],
+            "best_term": best_desc["description"]["term"]
+        }
+    
+    # Sort by score then alphabetically
+    sorted_concepts = sorted(
+        concept_scores.values(),
+        key=lambda x: (-x["score"], x["best_term"].lower())
+    )
+    
+    total_count = len(sorted_concepts)
+    
+    # Apply pagination
+    paginated_concepts = sorted_concepts[offset:offset + count]
+    concept_ids_for_details = [c["concept_id"] for c in paginated_concepts]
+    
+    # Get detailed descriptions for paginated concepts
+    expansion_contains = get_concepts_details_for_expansion(
+        concept_ids_for_details, display_language, include_designations
+    )
+    
+    return expansion_contains, total_count
 
 def get_concepts_details_for_expansion(concept_ids, display_language, include_designations):
     """
-    Get detailed concept information - optimized like File 1
+    Get detailed concept information with batch processing for large concept sets
     """
     if not concept_ids:
         return []
     
     try:
-        # Query descriptions for the specific concepts
+        # If concept set is small, use single query
+        if len(concept_ids) <= MAX_TERMS_PER_QUERY:
+            return get_concepts_details_single_query(concept_ids, display_language, include_designations)
+        
+        # For large sets, use batch processing
+        return get_concepts_details_batched(concept_ids, display_language, include_designations)
+        
+    except Exception as e:
+        logger.error(f"Error getting concept details: {str(e)}")
+        return []
+
+def get_concepts_details_single_query(concept_ids, display_language, include_designations):
+    """
+    Get concept details with single query for smaller sets
+    """
+    # Query descriptions for the specific concepts
+    query = {
+        "query": {
+            "bool": {
+                "must": [
+                    {"terms": {"concept_id": concept_ids}},
+                    {"term": {"active": True}},
+                    {"term": {"language_code": display_language}}
+                ]
+            }
+        },
+        "_source": ["concept_id", "type_id", "term", "language_code"],
+        "size": len(concept_ids) * 20,  # Allow multiple descriptions per concept
+    }
+    
+    resp = es.search(
+        index="descriptions",
+        body=query,
+        timeout='30s'
+    )
+    
+    # Group descriptions by concept
+    descriptions_by_concept = {}
+    for hit in resp["hits"]["hits"]:
+        source = hit["_source"]
+        concept_id = source["concept_id"]
+        
+        if concept_id not in descriptions_by_concept:
+            descriptions_by_concept[concept_id] = []
+        
+        descriptions_by_concept[concept_id].append(source)
+    
+    # Get preferred terms from language refsets
+    preferred_terms = get_preferred_terms(concept_ids, display_language)
+    
+    # Build concept entries
+    expansion_contains = []
+    for concept_id in concept_ids:
+        descriptions = descriptions_by_concept.get(concept_id, [])
+        preferred_term = preferred_terms.get(concept_id)
+        
+        concept_entry = build_concept_entry_from_descriptions(
+            concept_id, descriptions, include_designations, preferred_term
+        )
+        
+        if concept_entry:
+            expansion_contains.append(concept_entry)
+    
+    return expansion_contains
+
+def get_concepts_details_batched(concept_ids, display_language, include_designations):
+    """
+    Get concept details with batch processing for large sets
+    """
+    all_descriptions_by_concept = {}
+    
+    # Process in batches
+    batch_count = 0
+    total_batches = (len(concept_ids) + MAX_TERMS_PER_QUERY - 1) // MAX_TERMS_PER_QUERY
+    
+    for batch_concept_ids in chunk_list(concept_ids, MAX_TERMS_PER_QUERY):
+        batch_count += 1
+        print(f"Getting details for batch {batch_count}/{total_batches} with {len(batch_concept_ids)} concepts")
+        
+        # Query descriptions for this batch
         query = {
             "query": {
                 "bool": {
                     "must": [
-                        {"terms": {"concept_id": concept_ids}},
+                        {"terms": {"concept_id": batch_concept_ids}},
                         {"term": {"active": True}},
                         {"term": {"language_code": display_language}}
                     ]
                 }
             },
             "_source": ["concept_id", "type_id", "term", "language_code"],
-            "size": len(concept_ids) * 20,  # Allow multiple descriptions per concept
+            "size": len(batch_concept_ids) * 20,  # Allow multiple descriptions per concept
         }
         
-        resp = es.search(
-            index="descriptions",
-            body=query,
-            timeout='30s'
-        )
-        
-        # Group descriptions by concept
-        descriptions_by_concept = {}
-        for hit in resp["hits"]["hits"]:
-            source = hit["_source"]
-            concept_id = source["concept_id"]
-            
-            if concept_id not in descriptions_by_concept:
-                descriptions_by_concept[concept_id] = []
-            
-            descriptions_by_concept[concept_id].append(source)
-        
-        # Get preferred terms from language refsets (optimized batch query)
-        preferred_terms = get_preferred_terms(concept_ids, display_language)
-        
-        # Build concept entries
-        expansion_contains = []
-        for concept_id in concept_ids:
-            descriptions = descriptions_by_concept.get(concept_id, [])
-            preferred_term = preferred_terms.get(concept_id)
-            
-            concept_entry = build_concept_entry_from_descriptions(
-                concept_id, descriptions, include_designations, preferred_term
+        try:
+            resp = es.search(
+                index="descriptions",
+                body=query,
+                timeout='30s'
             )
             
-            if concept_entry:
-                expansion_contains.append(concept_entry)
+            # Group descriptions by concept
+            for hit in resp["hits"]["hits"]:
+                source = hit["_source"]
+                concept_id = source["concept_id"]
+                
+                if concept_id not in all_descriptions_by_concept:
+                    all_descriptions_by_concept[concept_id] = []
+                
+                all_descriptions_by_concept[concept_id].append(source)
+                
+        except Exception as e:
+            logger.error(f"Error getting descriptions for batch {batch_count}: {str(e)}")
+            continue
+    
+    # Get preferred terms from language refsets (this also needs batching)
+    preferred_terms = get_preferred_terms_batched(concept_ids, display_language)
+    
+    # Build concept entries
+    expansion_contains = []
+    for concept_id in concept_ids:
+        descriptions = all_descriptions_by_concept.get(concept_id, [])
+        preferred_term = preferred_terms.get(concept_id)
         
-        print(f"Built {len(expansion_contains)} concept entries")
-        return expansion_contains
+        concept_entry = build_concept_entry_from_descriptions(
+            concept_id, descriptions, include_designations, preferred_term
+        )
         
-    except Exception as e:
-        logger.error(f"Error getting concept details: {str(e)}")
-        return []
+        if concept_entry:
+            expansion_contains.append(concept_entry)
+    
+    print(f"Built {len(expansion_contains)} concept entries from {batch_count} batches")
+    return expansion_contains
 
 def get_preferred_terms(concept_ids, display_language):
     """
-    Optimized preferred terms lookup using composite aggregation approach
+    Get preferred terms with batching if needed
+    """
+    if len(concept_ids) <= MAX_TERMS_PER_QUERY:
+        return get_preferred_terms_single_query(concept_ids, display_language)
+    else:
+        return get_preferred_terms_batched(concept_ids, display_language)
+
+def get_preferred_terms_single_query(concept_ids, display_language):
+    """
+    Optimized preferred terms lookup for smaller sets
     """
     if not concept_ids:
         return {}
@@ -561,12 +916,35 @@ def get_preferred_terms(concept_ids, display_language):
             elif concept_id in preferred_fsns:
                 preferred_terms[concept_id] = preferred_fsns[concept_id]
         
-        logger.info(f"Found {len(preferred_terms)} preferred terms")
         return preferred_terms
         
     except Exception as e:
         logger.error(f"Error getting preferred terms: {str(e)}")
         return {}
+
+def get_preferred_terms_batched(concept_ids, display_language):
+    """
+    Get preferred terms with batch processing for large sets
+    """
+    all_preferred_terms = {}
+    
+    # Process in batches
+    batch_count = 0
+    total_batches = (len(concept_ids) + MAX_TERMS_PER_QUERY - 1) // MAX_TERMS_PER_QUERY
+    
+    for batch_concept_ids in chunk_list(concept_ids, MAX_TERMS_PER_QUERY):
+        batch_count += 1
+        print(f"Getting preferred terms for batch {batch_count}/{total_batches}")
+        
+        try:
+            batch_preferred = get_preferred_terms_single_query(batch_concept_ids, display_language)
+            all_preferred_terms.update(batch_preferred)
+        except Exception as e:
+            logger.error(f"Error getting preferred terms for batch {batch_count}: {str(e)}")
+            continue
+    
+    logger.info(f"Found {len(all_preferred_terms)} preferred terms across {batch_count} batches")
+    return all_preferred_terms
 
 def build_concept_entry_from_descriptions(concept_id, descriptions, include_designations, preferred_term=None):
     """
